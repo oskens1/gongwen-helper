@@ -1,0 +1,10 @@
+settings.json
+config.py
+.env
+**/__pycache__/
+*.pyc
+*.zip
+*.rar
+build/
+dist/
+build_log.txt
