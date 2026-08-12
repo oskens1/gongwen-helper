@@ -1,10 +1,23 @@
+# Local secrets and machine-specific settings
 settings.json
 config.py
 .env
-**/__pycache__/
-*.pyc
-*.zip
-*.rar
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output and archives
 build/
 dist/
 build_log.txt
+*.zip
+*.rar
+
+# Editors and Windows
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
