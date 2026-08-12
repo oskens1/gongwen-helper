@@ -1,0 +1,5 @@
+# DrissionPage 請鎖版本：程式依賴 4.1.x 的 ChromiumOptions 行為，
+# 升版可能改變 auto_port / set_user_data_path 的互動方式。
+DrissionPage==4.1.1.4
+pdfplumber
+pillow
