@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-新北市公務雲 - 公文小助手 v17 (測試版，基於 v16)
+新北市公務雲 - 公文小助手 v18（主任收文擴充）
 v17 改動：
   1. 修正支線下載視窗 ChromiumOptions 設定順序
      → 解決『支線錯誤: not enough values to unpack (expected 2, got 1)』
@@ -59,12 +59,14 @@ def load_settings():
         data['class_no'] = '1199'
     return data
 
-def save_settings(pin, path, class_no=None):
+def save_settings(pin, path, class_no=None, download_role=None):
     data = load_settings()
     data['pin'] = pin
     data['download_path'] = path
     if class_no is not None:
         data['class_no'] = class_no
+    if download_role is not None:
+        data['download_role'] = download_role
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f)
@@ -277,6 +279,67 @@ def get_smart_subject(row_ele):
 DOC_ROW_TAGS = ('承辦',)
 HEADER_NOBR_SKIP = 3            # 「承辦」清單前 N 個 nobr 是表頭/選單，不是公文列
 
+DOWNLOAD_ROLES = ('承辦人', '主管作業')
+
+# 支援巢狀選單，以及舊式樹狀選單「節點旁的子容器」。
+# 不跨過另一個角色；無法唯一定位時交由呼叫端停止。
+JS_ROLE_PROCESS = r"""
+const visible = e => !!(e.getClientRects().length);
+const labels = root => Array.from(root.querySelectorAll('a,span')).filter(
+    e => visible(e) && !e.querySelector('a,span'));
+const pick = root => {
+    const items = labels(root);
+    if (items.some(e => e.textContent.trim() === '承辦人')) return null;
+    const found = items.filter(e => e.textContent.trim() === '待辦理區');
+    return found.length === 1 ? found[0] : null;
+};
+for (let node = this.parentElement; node && node !== document.body; node = node.parentElement) {
+    const own = pick(node);
+    if (own) return own;
+    const next = node.nextElementSibling;
+    if (next && /^(DIV|UL|OL)$/.test(next.tagName)) {
+        // 只接受紧鄰節點的子容器，且不可包含另一個角色標題。
+        const texts = labels(next).map(e => e.textContent.trim());
+        if (!texts.includes('主管作業') && !texts.includes('承辦人')) {
+            const child = pick(next);
+            if (child) return child;
+        }
+    }
+    if (labels(node).some(e => e.textContent.trim() === '承辦人')) break;
+}
+return null;
+"""
+
+
+def open_download_list(target_tab, role):
+    """只切換收文入口；不改動簽收、核判或歸檔流程。"""
+    if role not in DOWNLOAD_ROLES:
+        raise RuntimeError(f"不支援的收文身分：{role}")
+    frame_left = target_tab.ele('tag:frame@name=FUNL', timeout=8)
+    if not frame_left:
+        raise RuntimeError("找不到左側公文選單 FUNL")
+    if role == '承辦人':
+        # 保留已驗證的組長入口。
+        role_button = frame_left.ele('tag:span@@text:承辦人') or frame_left.ele('text:承辦人')
+    else:
+        role_button = frame_left.ele(f'text={role}', timeout=5)
+    if not role_button:
+        raise RuntimeError(f"此帳號找不到『{role}』，請確認收文身分")
+    log_msg(f"收文入口：{role} → 待辦理區")
+    smart_click(role_button)
+    process_button = None
+    if role == '承辦人':
+        process_button = frame_left.ele('text:待辦理區', timeout=6)
+    else:
+        for _ in range(12):
+            process_button = role_button.run_js(JS_ROLE_PROCESS)
+            if process_button:
+                break
+            time.sleep(0.5)
+    if not process_button:
+        raise RuntimeError(f"無法唯一辨識『{role}』底下的待辦理區，請展開左側選單後回報畫面")
+    process_button.click()
+
 def _free_port(preferred=None):
     """ 取一個沒被佔用的本機埠。支線視窗必須用獨立埠，否則會跟主視窗打架。 """
     import socket
@@ -313,10 +376,33 @@ def _row_has_doc_link(nobr):
     return False
 
 
-def collect_doc_nobrs(frame_func, quiet=False):
+def collect_manager_links(frame_func, quiet=False):
+    """主管清單不依賴承辦／核稿／決行文字，只收多欄資料列的文號連結。
+
+    使用既有歸檔模組的數字文號判斷，再排除短頁碼、日期及重複連結。
+    無法辨識時停止，避免把不相容的清單誤報為零筆完成。
+    """
+    picked, seen = [], set()
+    for link in frame_func.eles('tag:a'):
+        doc_no = (link.text or '').strip()
+        if not re.fullmatch(r'[0-9]{8,20}', doc_no) or doc_no in seen:
+            continue
+        row = link.parent('tag:tr')
+        if not row or len(row.eles('xpath:./td')) < 2:
+            continue
+        seen.add(doc_no)
+        picked.append(link)
+    if not quiet:
+        log_msg(f"   (主管清單：辨識到 {len(picked)} 筆文號連結)")
+    return picked
+
+
+def collect_doc_nobrs(frame_func, quiet=False, role='承辦人'):
     """ 撈公文列的 nobr，依 DOM 順序、去重。
         「承辦」沿用 v16 原邏輯(跳過前 HEADER_NOBR_SKIP 個表頭)，行為不變；
         其他標籤(如「退」)則要求該列有純數字文號連結，才算公文列。 """
+    if role == '主管作業':
+        return collect_manager_links(frame_func, quiet=quiet)
     picked, seen = [], set()
     n_main = n_extra = 0
 
@@ -1281,7 +1367,8 @@ def run_automation_thread():
         btn_start.tag_bind("button", "<Button-1>", btn_start.on_click)
         return
 
-    save_settings(pin_code, base_path)
+    download_role = download_role_var.get()
+    save_settings(pin_code, base_path, download_role=download_role)
     download_path = base_path
     log_msg("🚀 啟動收文！(直接存於選擇的資料夾)")
     # 🔧 v17：印出實際使用的直譯器與套件狀態。
@@ -1335,14 +1422,7 @@ def run_automation_thread():
         if not target_tab:
             raise Exception("找不到二代公文")
 
-        # 承辦人 -> 待辦理區
-        frame_left = target_tab.ele('tag:frame@name=FUNL', timeout=8)
-        btn_contractor = frame_left.ele('tag:span@@text:承辦人') or frame_left.ele('text:承辦人')
-        if btn_contractor:
-            smart_click(btn_contractor)
-            btn_process = frame_left.ele('text:待辦理區', timeout=6)
-            if btn_process:
-                btn_process.click()
+        open_download_list(target_tab, download_role)
 
         # 等公文清單(FUNC的承辦列)載入, 取代固定 sleep
         date_str = datetime.now().strftime("%m%d")
@@ -1350,7 +1430,9 @@ def run_automation_thread():
         for _ in range(24):
             try:
                 frame_func = target_tab.ele('tag:frame@name=FUNC', timeout=1)
-                if frame_func and frame_func.eles('tag:nobr@@text():承辦'):
+                if frame_func and (collect_manager_links(frame_func, quiet=True)
+                                   if download_role == '主管作業'
+                                   else frame_func.eles('tag:nobr@@text():承辦')):
                     break
             except Exception:
                 pass
@@ -1359,8 +1441,12 @@ def run_automation_thread():
             frame_func = target_tab.ele('tag:frame@name=FUNC', timeout=5)
 
         # 🔧 v17 測試：原本只撈含「承辦」的 nobr，屬性「退」的公文不會被列入。
-        doc_nobrs = collect_doc_nobrs(frame_func)
+        if not frame_func:
+            raise RuntimeError("找不到公文清單 FUNC")
+        doc_nobrs = collect_doc_nobrs(frame_func, role=download_role)
         total_count = len(doc_nobrs)
+        if download_role == '主管作業' and not total_count:
+            raise RuntimeError("主管清單沒有可辨識的文號連結：可能沒有待辦公文，或清單格式不同。請確認右側清單後回報畫面。")
         log_msg(f"🧐 發現 {total_count} 筆公文...")
 
         for i in range(total_count):
@@ -1369,7 +1455,7 @@ def run_automation_thread():
             try:
                 target_tab.run_js("window.focus()")
                 frame_func = target_tab.ele('tag:frame@name=FUNC', timeout=5)
-                current_nobrs = collect_doc_nobrs(frame_func, quiet=True)
+                current_nobrs = collect_doc_nobrs(frame_func, quiet=True, role=download_role)
                 if len(current_nobrs) <= i:
                     continue
 
@@ -1666,7 +1752,7 @@ def show_help():
 # 🖥️ 主視窗建置 (完全復刻原版風格)
 # ==========================================
 root = tk.Tk()
-root.title("自動化公文小助手 · 新北市公務雲")
+root.title("自動化公文小助手 v18 · 新北市公務雲")
 try:
     root.iconbitmap(resource_path("icon.ico"))
 except Exception:
@@ -1697,7 +1783,7 @@ lbl_title = tk.Label(top_frame, text="自動化公文小助手",
                      bg=COLOR_HEADER_BLUE, fg="white")
 lbl_title.pack(pady=(15, 0))
 
-lbl_subtitle = tk.Label(top_frame, text="新北市公務雲 · 精準濾網版",
+lbl_subtitle = tk.Label(top_frame, text="新北市公務雲 · v18 組長／主任收文",
                         font=("Microsoft JhengHei", 11),
                         bg=COLOR_HEADER_BLUE, fg=COLOR_SUBTITLE)
 lbl_subtitle.pack(pady=(2, 16))
@@ -1742,6 +1828,15 @@ headless_var = tk.BooleanVar()
 headless_var.set(False) # 預設不勾選 (有頭)
 chk_headless = tk.Checkbutton(form_frame, text="無頭模式 (背景執行)", variable=headless_var, bg=COLOR_PAGE, fg=COLOR_TEXT_SUB, font=("Microsoft JhengHei", 12), activebackground=COLOR_PAGE, activeforeground=COLOR_TEXT_SUB, selectcolor=COLOR_BG_WHITE)
 chk_headless.grid(row=4, column=1, sticky="w", padx=(44, 6), pady=(8, 2))
+
+# 收文入口可依職務選擇；原使用者預設維持承辦人。
+saved_role = saved_settings.get('download_role', '承辦人')
+download_role_var = tk.StringVar(value=saved_role if saved_role in DOWNLOAD_ROLES else '承辦人')
+tk.Label(form_frame, text="收文身分：", bg=COLOR_PAGE, fg=COLOR_TEXT_MAIN,
+         font=("Microsoft JhengHei", 14)).grid(row=5, column=0, sticky="e", padx=6, pady=7)
+ttk.Combobox(form_frame, textvariable=download_role_var, values=DOWNLOAD_ROLES,
+             state="readonly", width=16, font=("Microsoft JhengHei", 12)).grid(
+                 row=5, column=1, sticky="w", padx=6, pady=7)
 
 
 # --- B. 按鈕區 (主 + 次) ---
@@ -1788,10 +1883,79 @@ log_text.insert(tk.END, "> 系統就緒，等待指令\n")
 
 # 關閉 PyInstaller 載入圖 (splash)；僅打包版有 pyi_splash，直接跑 .py 會略過
 try:
-    import pyi_splash
-    pyi_splash.close()
+    if '_PYI_SPLASH_IPC' in os.environ:
+        import pyi_splash
+        pyi_splash.close()
 except Exception:
     pass
 
-root.deiconify()  # 顯示已建好的視窗
-root.mainloop()
+def packaging_self_test(report_path):
+    """封裝驗收：不登入、不讀卡、不連公文系統，也不儲存 PIN。"""
+    import io
+    import ssl
+    import sqlite3
+    import ctypes
+    import lzma
+    import bz2
+    import certifi
+    from lxml import etree
+
+    assert PDFPLUMBER_OK, 'pdfplumber missing'
+    assert etree.fromstring(b'<test/>').tag == 'test'
+    ssl.create_default_context(cafile=certifi.where())
+    with sqlite3.connect(':memory:') as db:
+        assert db.execute('select 18').fetchone()[0] == 18
+    assert lzma.decompress(lzma.compress(b'v18')) == b'v18'
+    assert bz2.decompress(bz2.compress(b'v18')) == b'v18'
+    ctypes.create_string_buffer(b'v18')
+    Image.new('RGB', (8, 8)).save(io.BytesIO(), format='PNG')
+    options = ChromiumOptions()
+    options.set_local_port(9333)
+
+    # 自建一頁 PDF，測試文字抽取與 PDFium 原生 DLL，不碰使用者檔案。
+    content = b'BT /F1 12 Tf 20 50 Td (v18 smoke test) Tj ET'
+    objects = [b'<< /Type /Catalog /Pages 2 0 R >>',
+               b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+               b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+               b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+               b'<< /Length ' + str(len(content)).encode() + b' >>\nstream\n' + content + b'\nendstream']
+    pdf = bytearray(b'%PDF-1.4\n')
+    offsets = [0]
+    for i, obj in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf.extend(f'{i} 0 obj\n'.encode() + obj + b'\nendobj\n')
+    xref = len(pdf)
+    pdf.extend(b'xref\n0 6\n0000000000 65535 f \n')
+    for offset in offsets[1:]:
+        pdf.extend(f'{offset:010d} 00000 n \n'.encode())
+    pdf.extend(f'trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF'.encode())
+    with pdfplumber.open(io.BytesIO(pdf)) as document:
+        assert 'v18 smoke test' in document.pages[0].extract_text()
+        assert document.pages[0].to_image(resolution=72).original.size == (200, 100)
+
+    root.deiconify()
+    root.update()
+    show_help()
+    root.update()
+    help_windows = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+    assert help_windows and help_windows[0].winfo_exists()
+    for w in help_windows:
+        w.destroy()
+    download_role_var.set('主管作業')
+    assert download_role_var.get() == '主管作業'
+    download_role_var.set('承辦人')
+    report = {'version': 'v18', 'frozen': bool(getattr(sys, 'frozen', False)),
+              'python': sys.version, 'tk': root.tk.call('package', 'require', 'Tk'),
+              'checks': ['GUI', 'help dialog', 'role selector', 'DrissionPage options',
+                         'lxml', 'TLS certificates', 'sqlite3', 'ctypes', 'lzma', 'bz2',
+                         'Pillow PNG', 'PDF text', 'PDFium render'], 'passed': True}
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    root.destroy()
+
+
+if '--self-test' in sys.argv:
+    packaging_self_test(sys.argv[sys.argv.index('--self-test') + 1])
+else:
+    root.deiconify()  # 顯示已建好的視窗
+    root.mainloop()

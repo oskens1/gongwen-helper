@@ -23,14 +23,22 @@ python gongwen_helper.py
 
 ## 專案檔案
 
-- `gongwen_helper.py`：最新版原始碼（目前為 v17）
+- `gongwen_helper.py`：最新版原始碼（目前為 v18）
 - `requirements.txt`：Python 相依套件
 - `icon.ico`：程式圖示
 - GitHub Releases：已封裝、可直接使用的 Windows 版本
 
-## 版本
+## v18（2026/10/06）
 
-v17 修正外部附件下載等 9 項問題，封裝版自帶 VC runtime，免另裝相依套件。
+新增「收文身分」：組長選「承辦人」，主任選「主管作業」，再按「自動收文」。主任模式依選單層級尋找待辦理區，使用文號連結辨識公文，不限定承辦／核稿／決行文字。
+
+自動歸檔仍是原承辦人的簽收＋存查流程，不提供主任核稿或決行功能。主任實際帳號尚待使用者測試；若無法辨識選單或清單，程式會停止提示。
+
+封裝採乾淨 CPython 環境、onedir、不用 UPX，包含 Python、VC runtime 與 Tcl/Tk，不需另裝 Python。已通過 GUI、PDF 抽取／渲染、原生 DLL 相依檢查，以及清除 Python／Conda 環境後的中文路徑搬移測試；這不等於乾淨 Windows 他機或主任帳號驗證。
+
+操作及重建方式見 [使用說明](使用說明.md)。來源相依鎖定於 `requirements-lock.txt`；`build_v18.py` 先建 console 驗證，再建 windowed 正式版。
+
+v17 修正外部附件下載等 9 項問題，舊版仍保留於 Releases。
 
 ## 授權
 
